@@ -1,6 +1,6 @@
 // 番茄鐘護眼：每 25 分鐘把所有螢幕蓋上暗幕、休息 5 分鐘，結束時響鈴，自動開始下一輪。
 // 用法：Pomodoro [--work 分鐘] [--rest 分鐘]（可小數，測試用）
-// 規則：提早結束休息要長按 5 秒；跳過的休息會補到下一輪（最多補 5 分鐘）；每 4 輪休 15 分鐘
+// 規則：提早結束休息要長按 5 秒；跳過的休息會補到下一輪（最多補 5 分鐘）；每 4 輪休 15 分鐘；每完成一輪工作累積 1 顆小蕃茄
 import Cocoa
 import ServiceManagement
 
@@ -31,6 +31,57 @@ if let i = args.firstIndex(of: "--work"), i + 1 < args.count, let v = Double(arg
 if let i = args.firstIndex(of: "--rest"), i + 1 < args.count, let v = Double(args[i + 1]) { restMinutes = v }
 
 enum Phase { case work, rest }
+
+// ---------- 小蕃茄（累積）----------
+// 每完成一輪完整的工作計時 +1 顆；用「現在就休息」提早進休息不算。一天一筆，存在 UserDefaults。
+// 測試（--debug）時用另一份資料，不會弄髒真正的紀錄。
+let tomatoStore: UserDefaults = args.contains("--debug")
+    ? (UserDefaults(suiteName: "local.nicole.pomodoro-dim.test") ?? .standard) : .standard
+let dayFmt: DateFormatter = {
+    let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"; f.locale = Locale(identifier: "en_US_POSIX"); return f
+}()
+func tomatoLog() -> [String: Int] { (tomatoStore.dictionary(forKey: "tomatoLog") as? [String: Int]) ?? [:] }
+@discardableResult func addTomato() -> Int {
+    var log = tomatoLog(); let k = dayFmt.string(from: Date())
+    log[k, default: 0] += 1
+    tomatoStore.set(log, forKey: "tomatoLog")
+    return log[k] ?? 1
+}
+func tomatoToday() -> Int { tomatoLog()[dayFmt.string(from: Date())] ?? 0 }
+func tomatoTotal() -> Int { tomatoLog().values.reduce(0, +) }
+func tomatoWeek() -> Int {   // 本週（週一開始）
+    var cal = Calendar(identifier: .gregorian); cal.firstWeekday = 2
+    guard let start = cal.dateInterval(of: .weekOfYear, for: Date())?.start else { return 0 }
+    let log = tomatoLog(); var sum = 0
+    for i in 0..<7 { if let d = cal.date(byAdding: .day, value: i, to: start) { sum += log[dayFmt.string(from: d)] ?? 0 } }
+    return sum
+}
+func tomatoRow(_ n: Int) -> String { n == 0 ? "還沒有" : (n <= 12 ? String(repeating: "🍅", count: n) : "🍅 × \(n)") }
+
+// 今天的小蕃茄順序：R＝紅（完整做完一輪）、O＝橘（按「現在就休息」提早休息）。每天重新計算（只看今天）。
+// 紅蕃茄的總數仍存在 tomatoLog；順序只記新的，舊資料不足的紅蕃茄補在最前面。
+func tomatoSeqLog() -> [String: String] { (tomatoStore.dictionary(forKey: "tomatoSeq") as? [String: String]) ?? [:] }
+func addToSeq(_ ch: String) {
+    var s = tomatoSeqLog(); let k = dayFmt.string(from: Date())
+    s[k, default: ""] += ch
+    // 只留最近 14 天，免得越存越多
+    if s.count > 14 { for key in s.keys.sorted().dropLast(14) { s.removeValue(forKey: key) } }
+    tomatoStore.set(s, forKey: "tomatoSeq")
+}
+func todaySeq() -> [Character] {
+    let seq = tomatoSeqLog()[dayFmt.string(from: Date())] ?? ""
+    let seqReds = seq.filter { $0 == "R" }.count
+    let missing = max(0, tomatoToday() - seqReds)
+    return Array(String(repeating: "R", count: missing) + seq)
+}
+func tomatoEmojiRow() -> String {
+    let s = todaySeq()
+    if s.isEmpty { return "還沒有" }
+    return s.count <= 12 ? String(s.map { $0 == "O" ? "🟠" : "🍅" }) : "🍅 × \(s.filter { $0 == "R" }.count)　🟠 × \(s.filter { $0 == "O" }.count)"
+}
+func tomatoImage(_ name: String) -> NSImage? {
+    Bundle.main.url(forResource: name, withExtension: "png").flatMap { NSImage(contentsOf: $0) }
+}
 
 // ---------- 隨開機開啟（macOS 13 以上）----------
 func loginEnabled() -> Bool {
@@ -179,6 +230,10 @@ final class App: NSObject, NSApplicationDelegate {
     var workMenu: NSMenu!
     var restMenu: NSMenu!
     var loginItem: NSMenuItem!
+    var tomatoTodayItem: NSMenuItem!
+    var tomatoSumItem: NSMenuItem!
+    var tomatoHistoryMenu: NSMenu!
+    var tomatoDay = ""          // 上次刷新小蕃茄選單時的日期，換日時自動刷新
     var roundCount = 0          // 第幾次休息
     var restDebt = 0.0          // 欠的休息（分鐘），下一輪補
     var restNote = ""
@@ -188,6 +243,14 @@ final class App: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         statusLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         menu.addItem(statusLine)
+        menu.addItem(.separator())
+        tomatoTodayItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        tomatoSumItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        menu.addItem(tomatoTodayItem)
+        menu.addItem(tomatoSumItem)
+        let hItem = NSMenuItem(title: "小蕃茄紀錄", action: nil, keyEquivalent: "")
+        tomatoHistoryMenu = NSMenu(); hItem.submenu = tomatoHistoryMenu
+        menu.addItem(hItem)
         menu.addItem(.separator())
         pauseItem = NSMenuItem(title: "暫停", action: #selector(togglePause), keyEquivalent: "")
         menu.addItem(pauseItem)
@@ -224,6 +287,7 @@ final class App: NSObject, NSApplicationDelegate {
             guard let self = self, self.phase == .rest else { return }
             self.buildOverlays()
         }
+        refreshTomato()
         startWork()
         ticker = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.tick() }
         RunLoop.main.add(ticker!, forMode: .common)
@@ -239,7 +303,7 @@ final class App: NSObject, NSApplicationDelegate {
         update()
     }
 
-    func startRest() {
+    func startRest(earned: Bool = false, forced: Bool = false) {
         phase = .rest
         restStart = Date()
         roundCount += 1
@@ -248,6 +312,16 @@ final class App: NSObject, NSApplicationDelegate {
         let extra = min(restDebt, maxMakeup)
         restDebt = 0
         var notes: [String] = []
+        if earned {                       // 完整做完一輪工作 → 小蕃茄 +1
+            let n = addTomato()
+            addToSeq("R")
+            refreshTomato()
+            if debugLog { print("TOMATO red today=\(n) week=\(tomatoWeek()) total=\(tomatoTotal()) seq=\(String(todaySeq()))") }
+        } else if forced {                // 按「現在就休息」提早休息 → 多一顆橘蕃茄
+            addToSeq("O")
+            refreshTomato()
+            if debugLog { print("TOMATO orange seq=\(String(todaySeq()))") }
+        }
         if isLong { notes.append("第 \(roundCount) 輪，長休息") }
         if extra > 0 { notes.append(String(format: "含補休 %.1f 分鐘", extra)) }
         restNote = notes.joined(separator: "｜")
@@ -294,7 +368,7 @@ final class App: NSObject, NSApplicationDelegate {
 
     func tick() {
         if !paused && deadline.timeIntervalSinceNow <= 0 {
-            if phase == .work { startRest() } else { finishRest() }
+            if phase == .work { startRest(earned: true) } else { finishRest() }
             return
         }
         update()
@@ -305,7 +379,43 @@ final class App: NSObject, NSApplicationDelegate {
         return String(format: "%02d:%02d", s / 60, s % 60)
     }
 
+    // 小蕃茄選單：今天（用 🍅 排出來）、本週與累積、最近 7 天、歸零
+    func refreshTomato() {
+        tomatoDay = dayFmt.string(from: Date())
+        let t = tomatoToday()
+        tomatoTodayItem.title = "今天  \(tomatoEmojiRow())" + (t > 0 ? "（\(t) 顆）" : "")
+        tomatoSumItem.title = "本週 \(tomatoWeek()) 顆　累積 \(tomatoTotal()) 顆"
+        tomatoHistoryMenu.removeAllItems()
+        let log = tomatoLog()
+        let wd = DateFormatter(); wd.locale = Locale(identifier: "zh_TW"); wd.dateFormat = "M/d（E）"
+        for i in 0..<7 {
+            guard let d = Calendar.current.date(byAdding: .day, value: -i, to: Date()) else { continue }
+            let n = log[dayFmt.string(from: d)] ?? 0
+            tomatoHistoryMenu.addItem(NSMenuItem(title: "\(wd.string(from: d))　\(n) 顆", action: nil, keyEquivalent: ""))
+        }
+        tomatoHistoryMenu.addItem(.separator())
+        let reset = NSMenuItem(title: "全部歸零…", action: #selector(resetTomatoes), keyEquivalent: "")
+        reset.target = self
+        tomatoHistoryMenu.addItem(reset)
+        if debugLog { print("MENU \(tomatoTodayItem.title) | \(tomatoSumItem.title)") }
+    }
+
+    @objc func resetTomatoes() {
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.messageText = "要把所有小蕃茄歸零嗎？"
+        a.informativeText = "目前累積 \(tomatoTotal()) 顆。歸零後無法復原。"
+        a.addButton(withTitle: "取消")
+        a.addButton(withTitle: "歸零")
+        if a.runModal() == .alertSecondButtonReturn {
+            tomatoStore.removeObject(forKey: "tomatoLog")
+            tomatoStore.removeObject(forKey: "tomatoSeq")
+            refreshTomato()
+        }
+    }
+
     func update() {
+        if dayFmt.string(from: Date()) != tomatoDay { refreshTomato() }   // 過了午夜自動換日
         let r = remaining()
         let icon = phase == .work ? "🍅" : "🌙"
         statusItem.button?.title = "\(icon) \(fmt(r))" + (paused ? " ⏸" : "")
@@ -468,6 +578,49 @@ final class App: NSObject, NSApplicationDelegate {
 
             for v in [countdown, hint, title, note, skip] as [NSView] { content.addSubview(v) }
             let mx = size.width * 0.05, my = size.height * 0.055
+
+            // 左下角：今天的小蕃茄，一顆一顆排成一列（紅＝完整做完一輪、橘＝提早休息），沒有數字
+            let seq = todaySeq()
+            // 左下角：今天的「紅色光球 × 數字」「橘色光球 × 數字」（光球跟中間的光球同一種平面柔光；每天重新計算）
+            let reds = seq.filter { $0 == "R" }.count, oranges = seq.filter { $0 == "O" }.count
+            let d = max(14, size.height * 0.024)                    // 光球直徑
+            let rowH = d * 1.8
+            let row = NSView()
+            row.translatesAutoresizingMaskIntoConstraints = false
+            row.wantsLayer = true
+            var x: CGFloat = 0
+            let gapGroup = d * 1.8
+            func addGroup(_ count: Int, glow: NSColor, top: NSColor, bottom: NSColor) {
+                guard count > 0 else { return }
+                let cy = rowH / 2
+                let gl = glowLayer(diameter: d * 3.4, center: CGPoint(x: x + d / 2, y: cy),
+                                   colors: [glow.withAlphaComponent(0.50), glow.withAlphaComponent(0.20)])
+                row.layer?.addSublayer(gl)
+                breathe(gl, from: 0.90, to: 1.10, fade: true)
+                let disc = CAGradientLayer()
+                disc.frame = CGRect(x: x, y: cy - d / 2, width: d, height: d)
+                disc.cornerRadius = d / 2
+                disc.colors = [top.cgColor, bottom.cgColor]
+                disc.startPoint = CGPoint(x: 0.2, y: 1); disc.endPoint = CGPoint(x: 0.8, y: 0)
+                row.layer?.addSublayer(disc)
+                let num = NSTextField(labelWithString: "× \(count)")
+                num.font = NSFont.monospacedDigitSystemFont(ofSize: d * 0.85, weight: .ultraLight)
+                num.textColor = softWhite.withAlphaComponent(0.85)
+                num.sizeToFit()
+                num.frame.origin = CGPoint(x: x + d + d * 0.45, y: cy - num.frame.height / 2)
+                row.addSubview(num)
+                x += d + d * 0.45 + num.frame.width + gapGroup
+            }
+            addGroup(reds, glow: rgb(255, 92, 72), top: rgb(255, 128, 104), bottom: rgb(226, 62, 56))
+            addGroup(oranges, glow: rgb(255, 150, 60), top: rgb(255, 184, 96), bottom: rgb(240, 120, 40))
+            let maxX = max(1, x - gapGroup)
+            content.addSubview(row)
+            NSLayoutConstraint.activate([
+                row.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: mx),
+                row.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -my),
+                row.widthAnchor.constraint(equalToConstant: maxX),
+                row.heightAnchor.constraint(equalToConstant: seq.isEmpty ? 1 : rowH),
+            ])
             NSLayoutConstraint.activate([
                 countdown.centerXAnchor.constraint(equalTo: content.centerXAnchor),
                 countdown.topAnchor.constraint(equalTo: content.topAnchor, constant: size.height * 0.44 + D * 0.58 + S * 0.03),
@@ -476,7 +629,7 @@ final class App: NSObject, NSApplicationDelegate {
                 title.centerXAnchor.constraint(equalTo: content.centerXAnchor),
                 title.topAnchor.constraint(equalTo: content.topAnchor, constant: size.height * 0.075),
                 note.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: mx),
-                note.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -my),
+                note.bottomAnchor.constraint(equalTo: row.topAnchor, constant: -12),
                 skip.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -mx),
                 skip.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -my),
             ])
@@ -540,7 +693,7 @@ final class App: NSObject, NSApplicationDelegate {
             a.runModal()
         }
     }
-    @objc func restNow() { startRest() }
+    @objc func restNow() { startRest(forced: true) }
     @objc func restartWork() { startWork() }
     // 提早結束休息：沒休完的時間記成「欠的休息」，下一輪補（最多補 5 分鐘）
     @objc func skipRest() {
