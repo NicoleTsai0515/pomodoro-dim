@@ -10,6 +10,8 @@ mkdir -p "$APP/Contents/MacOS"
 swiftc -O -target arm64-apple-macos12.0 Pomodoro.swift -o "$BUILD/arm64"
 swiftc -O -target x86_64-apple-macos12.0 Pomodoro.swift -o "$BUILD/x86_64"
 lipo -create "$BUILD/arm64" "$BUILD/x86_64" -output "$APP/Contents/MacOS/Pomodoro"
+mkdir -p "$APP/Contents/Resources"
+cp RestEnd.m4a "$APP/Contents/Resources/RestEnd.m4a"   # 休息結束的聲音
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

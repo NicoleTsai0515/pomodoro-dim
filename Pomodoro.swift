@@ -173,6 +173,7 @@ final class App: NSObject, NSApplicationDelegate {
     var overlays: [OverlayWindow] = []
     var overlayUIs: [OverlayUI] = []
     var restStart = Date()
+    var restEndSound: NSSound?     // 要一直留著參照，聲音才不會播到一半被釋放
     var statusLine: NSMenuItem!
     var pauseItem: NSMenuItem!
     var workMenu: NSMenu!
@@ -267,8 +268,23 @@ final class App: NSObject, NSApplicationDelegate {
 
     func finishRest() {
         hideOverlays()
-        play("Hero", times: 3)   // 鬧鈴叫三聲
+        playRestEnd()
         startWork()
+    }
+
+    // 休息結束的聲音：自製的太空漂浮長音（app 內的 RestEnd.m4a）；找不到檔案就退回系統的 Hero
+    func playRestEnd() {
+        if let url = Bundle.main.url(forResource: "RestEnd", withExtension: "m4a"),
+           let s = NSSound(contentsOf: url, byReference: false) {
+            restEndSound?.stop()
+            restEndSound = s
+            s.volume = 1.0
+            let ok = s.play()
+            if debugLog { print(String(format: "PLAY rest-end ok=%@ duration=%.1f", ok ? "true" : "false", s.duration)) }
+        } else {
+            play("Hero", times: 3)
+            if debugLog { print("PLAY fallback Hero") }
+        }
     }
 
     // ---------- 計時 ----------
