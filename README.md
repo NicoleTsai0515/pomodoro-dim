@@ -19,6 +19,13 @@
 - 系統開了「減少動態效果」時，不播放呼吸動畫
 - 蘋果晶片與 Intel Mac 都能跑（macOS 12 以上；隨開機開啟需 macOS 13 以上）
 
+## 畫面
+休息畫面（中間）、往右滑的基礎設定、往左滑的本週儀表板（圖中的數字是範例資料）：
+
+![休息畫面](screenshots/rest.png)
+![基礎設定](screenshots/settings.png)
+![本週儀表板](screenshots/week.png)
+
 ## 下載與安裝（一分鐘）
 1. 下載最新版：**[PomodoroDim.zip](https://github.com/NicoleTsai0515/pomodoro-dim/releases/latest/download/PomodoroDim.zip)**（也可到 [Releases](https://github.com/NicoleTsai0515/pomodoro-dim/releases/latest) 頁面）
 2. 雙擊解壓縮，把「番茄鐘護眼」拖進「應用程式」資料夾
@@ -56,7 +63,7 @@ cd pomodoro-dim
 番茄鐘護眼.app/Contents/MacOS/Pomodoro --work 0.1 --rest 0.3
 ```
 
-其他測試旗標：`--hold 秒`（長按幾秒）、`--long 分鐘`、`--every 輪數`、`--debug`（紀錄存在另一份測試資料，不會弄髒真正的）、`--page -1|0|1`（休息畫面一開始停在哪一頁）、`--login on|off|status`。
+其他測試旗標：`--hold 秒`（長按幾秒）、`--long 分鐘`、`--every 輪數`、`--debug`（紀錄存在另一份測試資料，不會弄髒真正的）、`--page -1|0|1`（休息畫面一開始停在哪一頁）、`--startrest`（一開就進休息畫面）、`--opaque`（休息畫面完全不透出底下視窗，截圖用）、`--login on|off|status`。
 
 ## 已知限制
 - 「調暗」是蓋一層全螢幕暗幕，不是改螢幕硬體亮度（外接螢幕與 iPad 本來就改不了亮度）；暗幕不是 100% 不透明，底下視窗會隱約可見。

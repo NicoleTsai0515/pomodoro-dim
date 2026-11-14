@@ -743,6 +743,7 @@ final class App: NSObject, NSApplicationDelegate {
         refreshTomato()
         startWork()
         if args.contains("--dashboard") { dashboard.show() }
+        if args.contains("--startrest") { startRest() }      // 測試／截圖用：一開就進休息畫面
         ticker = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.tick() }
         RunLoop.main.add(ticker!, forMode: .common)
     }
@@ -999,7 +1000,7 @@ final class App: NSObject, NSApplicationDelegate {
             let w = OverlayWindow(contentRect: screen.frame, styleMask: .borderless,
                                   backing: .buffered, defer: false, screen: screen)
             w.isReleasedWhenClosed = false
-            w.backgroundColor = nightGreen.withAlphaComponent(0.96)
+            w.backgroundColor = nightGreen.withAlphaComponent(args.contains("--opaque") ? 1.0 : 0.96)   // --opaque：截圖用，完全不透出底下視窗
             w.isOpaque = false
             w.hasShadow = false
             w.level = .screenSaver
