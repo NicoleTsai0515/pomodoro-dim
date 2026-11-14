@@ -12,12 +12,14 @@ swiftc -O -target x86_64-apple-macos12.0 Pomodoro.swift -o "$BUILD/x86_64"
 lipo -create "$BUILD/arm64" "$BUILD/x86_64" -output "$APP/Contents/MacOS/Pomodoro"
 mkdir -p "$APP/Contents/Resources"
 cp RestEnd.m4a "$APP/Contents/Resources/RestEnd.m4a"   # 休息結束的聲音
+cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"   # app 圖示（小蕃茄）
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>CFBundleName</key><string>番茄鐘護眼</string>
 <key>CFBundleIdentifier</key><string>local.nicole.pomodoro-dim</string>
+<key>CFBundleIconFile</key><string>AppIcon</string>
 <key>CFBundleExecutable</key><string>Pomodoro</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>LSMinimumSystemVersion</key><string>12.0</string>

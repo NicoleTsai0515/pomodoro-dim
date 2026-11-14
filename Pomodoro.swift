@@ -21,6 +21,12 @@ func numArg(_ name: String) -> Double? {
     if let i = args.firstIndex(of: name), i + 1 < args.count { return Double(args[i + 1]) }
     return nil
 }
+if let v = defaults.object(forKey: "longRest") as? Double { longRestMinutes = v }
+if let v = defaults.object(forKey: "longEvery") as? Int { longEvery = v }
+if let v = defaults.object(forKey: "holdSec") as? Double { holdSeconds = v }
+var endVolume: Float = (defaults.object(forKey: "endVolume") as? Float) ?? 0.6
+let initialPage = Int(numArg("--page") ?? 0)        // 測試用：休息畫面一開始停在哪一頁
+let pageCycle = args.contains("--pagecycle")          // 測試用：自動左右換頁
 if let v = numArg("--long") { longRestMinutes = v }
 if let v = numArg("--every") { longEvery = Int(v) }
 if let v = numArg("--hold") { holdSeconds = v }
@@ -78,6 +84,26 @@ func tomatoEmojiRow() -> String {
     let s = todaySeq()
     if s.isEmpty { return "還沒有" }
     return s.count <= 12 ? String(s.map { $0 == "O" ? "🟠" : "🍅" }) : "🍅 × \(s.filter { $0 == "R" }.count)　🟠 × \(s.filter { $0 == "O" }.count)"
+}
+// ---------- 專注／休息時間統計 ----------
+// 實際計時：工作階段（沒暫停）累積成「專注」，休息階段累積成「休息」；電腦睡眠、關 app 的時間不算。一天一筆（秒）。
+func timeLog(_ key: String) -> [String: Double] { (tomatoStore.dictionary(forKey: key) as? [String: Double]) ?? [:] }
+func addTime(_ key: String, _ sec: Double) {
+    var log = timeLog(key); log[dayFmt.string(from: Date()), default: 0] += sec
+    tomatoStore.set(log, forKey: key)
+}
+func timeToday(_ log: [String: Double]) -> Double { log[dayFmt.string(from: Date())] ?? 0 }
+func timeTotal(_ log: [String: Double]) -> Double { log.values.reduce(0, +) }
+func timeWeek(_ log: [String: Double]) -> Double {
+    var cal = Calendar(identifier: .gregorian); cal.firstWeekday = 2
+    guard let start = cal.dateInterval(of: .weekOfYear, for: Date())?.start else { return 0 }
+    var sum = 0.0
+    for i in 0..<7 { if let d = cal.date(byAdding: .day, value: i, to: start) { sum += log[dayFmt.string(from: d)] ?? 0 } }
+    return sum
+}
+func durText(_ sec: Double) -> String {   // 同時寫分鐘與小時
+    let m = Int((sec / 60).rounded())
+    return "\(m) 分鐘（" + String(format: "%.1f", sec / 3600) + " 小時）"
 }
 func tomatoImage(_ name: String) -> NSImage? {
     Bundle.main.url(forResource: name, withExtension: "png").flatMap { NSImage(contentsOf: $0) }
@@ -143,6 +169,26 @@ let nightGreen = rgb(9, 20, 17)      // 近黑的深青綠（底色）
 
 final class OverlayWindow: NSWindow {
     override var canBecomeKey: Bool { true }
+    var onPage: ((Int) -> Void)?          // -1＝手指往右滑（看基礎設定）、+1＝手指往左滑（看本週）
+    private var acc: CGFloat = 0
+    private var fired = false
+    private var dragX: CGFloat?
+    override func scrollWheel(with e: NSEvent) {
+        guard e.hasPreciseScrollingDeltas else { super.scrollWheel(with: e); return }
+        if e.phase == .began || e.phase == .mayBegin { acc = 0; fired = false }
+        let dx = e.isDirectionInvertedFromDevice ? e.scrollingDeltaX : -e.scrollingDeltaX   // >0＝手指往右
+        if abs(e.scrollingDeltaX) > abs(e.scrollingDeltaY) { acc += dx }
+        if !fired && abs(acc) > 70 { fired = true; onPage?(acc > 0 ? -1 : 1) }
+        if e.phase == .ended || e.phase == .cancelled { acc = 0; fired = false }
+    }
+    override func keyDown(with e: NSEvent) {
+        if e.keyCode == 123 { onPage?(1) } else if e.keyCode == 124 { onPage?(-1) } else { super.keyDown(with: e) }
+    }
+    override func mouseDown(with e: NSEvent) { dragX = e.locationInWindow.x }
+    override func mouseUp(with e: NSEvent) {
+        if let x0 = dragX { let dx = e.locationInWindow.x - x0; if abs(dx) > 140 { onPage?(dx > 0 ? -1 : 1) } }
+        dragX = nil
+    }
 }
 
 // 加字距的文字（細黑體 + 寬字距，是參考作品常見的「雜誌感」小字）
@@ -163,33 +209,57 @@ struct OverlayUI {
     let hint: NSTextField
     let title: NSTextField
     let note: NSTextField
+    let skip: HoldButton
+    let timeLine: NSTextField
 }
 
-// 要長按才會觸發的按鈕（防止手滑或習慣性跳過休息）；按住時底下的檸檬黃細線會慢慢拉長
+// 要長按才會觸發的按鈕（防止手滑或習慣性跳過休息）；文字下方留一段距離，有一條淡淡的底線，
+// 按住時一條柔和的淺黃綠亮線沿著底線慢慢拉長
 final class HoldButton: NSButton {
     var onComplete: (() -> Void)?
     var idleTitle = ""
     private var timer: Timer?
     private var start = Date()
-    private let bar = CALayer()
+    private var progress: CGFloat = 0
+    private var idleWidth: CGFloat = 0          // 沒按時文字的寬度＝線的總長（按住時文字變短，線不跟著縮）
+    private let track = CALayer()
+    private let bar = CAGradientLayer()
+    private let lineGap: CGFloat = 18           // 線離文字底部的距離
 
     func setup() {
         wantsLayer = true
-        bar.backgroundColor = lemon.cgColor
-        bar.frame = CGRect(x: 0, y: 0, width: 0, height: 2)
+        layer?.masksToBounds = false
+        track.backgroundColor = softWhite.withAlphaComponent(0.14).cgColor
+        bar.colors = [paleLime.withAlphaComponent(0.15).cgColor, paleLime.cgColor, rgb(234, 230, 148).cgColor]
+        bar.locations = [0, 0.6, 1]
+        bar.startPoint = CGPoint(x: 0, y: 0.5); bar.endPoint = CGPoint(x: 1, y: 0.5)
+        bar.cornerRadius = 1
+        bar.shadowColor = paleLime.cgColor; bar.shadowOpacity = 0.35; bar.shadowRadius = 4; bar.shadowOffset = .zero
+        layer?.addSublayer(track)
         layer?.addSublayer(bar)
+        updateLine()
     }
     func show(_ t: String) {
         attributedTitle = NSAttributedString(string: t, attributes: [
             .foregroundColor: softWhite.withAlphaComponent(0.55),
             .font: NSFont.systemFont(ofSize: 15, weight: .light),
             .kern: 1.5])
+        if t == idleTitle { idleWidth = attributedTitle.size().width }
+        updateLine()
     }
-    private func setBar(_ progress: CGFloat) {
+    override func layout() { super.layout(); updateLine() }
+    private func updateLine() {
+        guard idleWidth > 0 else { return }
+        // 線在文字下方（按鈕的層座標是上下顛倒的，往下＝y 增加）
+        let x = bounds.width - idleWidth
+        let y = bounds.height + lineGap
         CATransaction.begin(); CATransaction.setDisableActions(true)
-        bar.frame = CGRect(x: 0, y: 0, width: bounds.width * progress, height: 2)
+        track.frame = CGRect(x: x, y: y, width: idleWidth, height: 1)
+        bar.frame = CGRect(x: x, y: y - 0.5, width: idleWidth * progress, height: 2)
+        bar.isHidden = progress <= 0
         CATransaction.commit()
     }
+    private func setBar(_ p: CGFloat) { progress = p; updateLine() }
     override func mouseDown(with event: NSEvent) {
         start = Date()
         timer?.invalidate()
@@ -214,7 +284,390 @@ final class HoldButton: NSButton {
     }
 }
 
+// ---------- 儀表板（選單「儀表板」開窗）----------
+// 字體與休息畫面相同（系統字體：超細數字＋小字寬字距）；每週日到週六一組，週日換新的一週。
+final class DashText: NSTextField {
+    var size: CGFloat = 12
+    var weight: NSFont.Weight = .regular
+    var tint: NSColor = softWhite
+    var kern: CGFloat = 0
+    var mono = false
+    convenience init(_ size: CGFloat, _ weight: NSFont.Weight, _ tint: NSColor, kern: CGFloat = 0, mono: Bool = false) {
+        self.init(frame: .zero)
+        self.size = size; self.weight = weight; self.tint = tint; self.kern = kern; self.mono = mono
+        isEditable = false; isSelectable = false; isBordered = false; drawsBackground = false
+    }
+    func put(_ s: String) {
+        let f = mono ? NSFont.monospacedDigitSystemFont(ofSize: size, weight: weight) : NSFont.systemFont(ofSize: size, weight: weight)
+        attributedStringValue = NSAttributedString(string: s, attributes: [.font: f, .foregroundColor: tint, .kern: kern])
+        sizeToFit()
+    }
+    func centered(_ s: String, cx: CGFloat, top: CGFloat, H: CGFloat) {
+        put(s); frame.origin = CGPoint(x: cx - frame.width / 2, y: H - top - frame.height)
+    }
+    func left(_ s: String, x: CGFloat, top: CGFloat, H: CGFloat) {
+        put(s); frame.origin = CGPoint(x: x, y: H - top - frame.height)
+    }
+}
+
+final class DashCol {
+    let day = DashText(12, .regular, softWhite, kern: 1)
+    let fl = DashText(10, .regular, softWhite.withAlphaComponent(0.4), kern: 3)
+    let fv = DashText(11, .regular, softWhite)
+    let rl = DashText(10, .regular, softWhite.withAlphaComponent(0.4), kern: 3)
+    let rv = DashText(11, .regular, softWhite)
+    let fbar = CAGradientLayer()
+    let rbar = CAGradientLayer()
+}
+
+final class Dashboard {
+    var window: NSWindow?
+    let W: CGFloat = 960, H: CGFloat = 740
+    let content = NSView()
+    let todayLab = DashText(12, .regular, softWhite.withAlphaComponent(0.45), kern: 4)
+    let redNum = DashText(44, .ultraLight, softWhite, mono: true)
+    let orgNum = DashText(44, .ultraLight, softWhite, mono: true)
+    let fLab = DashText(12, .regular, softWhite.withAlphaComponent(0.45), kern: 4.5)
+    let fNum = DashText(84, .ultraLight, softWhite, mono: true)
+    let fUnit = DashText(22, .light, softWhite)
+    let fHr = DashText(12, .regular, softWhite.withAlphaComponent(0.45), kern: 3)
+    let rLab = DashText(12, .regular, softWhite.withAlphaComponent(0.45), kern: 4.5)
+    let rNum = DashText(84, .ultraLight, rgb(255, 200, 130, 0.9), mono: true)
+    let rUnit = DashText(22, .light, rgb(255, 200, 130, 0.9))
+    let rHr = DashText(12, .regular, softWhite.withAlphaComponent(0.45), kern: 3)
+    let chartLab = DashText(11, .regular, softWhite.withAlphaComponent(0.45), kern: 3)
+    var cols: [DashCol] = []
+    var lastSig = ""
+    let dayNames = ["週日", "週一", "週二", "週三", "週四", "週五", "週六"]
+
+    func orb(cx: CGFloat, topCy: CGFloat, d: CGFloat, red: Bool, glow: NSColor, top: NSColor, bottom: NSColor) {
+        let cy = H - topCy
+        let g = CAGradientLayer()
+        g.type = .radial
+        g.frame = CGRect(x: cx - d * 1.7, y: cy - d * 1.7, width: d * 3.4, height: d * 3.4)
+        g.colors = [glow.withAlphaComponent(0.50).cgColor, glow.withAlphaComponent(0.20).cgColor, NSColor.clear.cgColor, NSColor.clear.cgColor]
+        g.locations = [0, 0.35, 0.7, 1]
+        g.startPoint = CGPoint(x: 0.5, y: 0.5); g.endPoint = CGPoint(x: 1, y: 1)
+        content.layer?.addSublayer(g)
+        if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            func anim(_ key: String, _ a: CGFloat, _ b: CGFloat) -> CABasicAnimation {
+                let x = CABasicAnimation(keyPath: key)
+                x.fromValue = a; x.toValue = b; x.duration = 4; x.autoreverses = true; x.repeatCount = .infinity
+                x.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                return x
+            }
+            g.add(anim("transform.scale", 0.92, 1.08), forKey: "s")
+            g.add(anim("opacity", 0.7, 1.0), forKey: "o")
+        }
+        let disc = CAGradientLayer()
+        disc.frame = CGRect(x: cx - d / 2, y: cy - d * tomatoFlat / 2, width: d, height: d * tomatoFlat)
+        disc.cornerRadius = d * tomatoFlat / 2
+        disc.colors = [top.cgColor, bottom.cgColor]
+        disc.startPoint = CGPoint(x: 0.2, y: 1); disc.endPoint = CGPoint(x: 0.8, y: 0)
+        let fm = CAGradientLayer(); fm.type = .radial; fm.frame = disc.bounds
+        fm.colors = [NSColor.white.cgColor, NSColor.white.cgColor, NSColor.clear.cgColor]
+        fm.locations = [0, 0.9, 1]
+        fm.startPoint = CGPoint(x: 0.5, y: 0.5); fm.endPoint = CGPoint(x: 1, y: 1)
+        disc.mask = fm
+        content.layer?.addSublayer(disc)
+        if let cl = content.layer { orbFace(host: cl, x: cx - d / 2, cy: cy, d: d, red: red) }
+    }
+
+    func build() {
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: W, height: H),
+                         styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
+                         backing: .buffered, defer: false)
+        w.title = "番茄鐘護眼｜儀表板"
+        w.titlebarAppearsTransparent = true
+        w.titleVisibility = .hidden
+        w.isReleasedWhenClosed = false
+        w.backgroundColor = nightGreen
+        w.appearance = NSAppearance(named: .darkAqua)
+        buildContent(halo: true)
+        w.contentView = content
+        window = w
+        w.center()
+    }
+
+    // 建出儀表板的內容（960×740）；halo＝true 時自帶底色與光暈（獨立視窗用），休息畫面裡不帶，直接用暗幕當底
+    func buildContent(halo withHalo: Bool) {
+        content.frame = NSRect(x: 0, y: 0, width: W, height: H)
+        content.wantsLayer = true
+        content.layer?.backgroundColor = withHalo ? nightGreen.cgColor : NSColor.clear.cgColor
+        if withHalo {
+            let halo = CAGradientLayer()
+            halo.type = .radial
+            halo.frame = CGRect(x: W * 0.12, y: H * 0.38, width: W * 0.76, height: H * 0.78)
+            halo.colors = [deepTeal.withAlphaComponent(0.34).cgColor, deepTeal.withAlphaComponent(0.12).cgColor, NSColor.clear.cgColor]
+            halo.locations = [0, 0.5, 1]
+            halo.startPoint = CGPoint(x: 0.5, y: 0.5); halo.endPoint = CGPoint(x: 1, y: 1)
+            content.layer?.addSublayer(halo)
+        }
+        orb(cx: 319, topCy: 119, d: 46, red: true, glow: rgb(255, 92, 72), top: rgb(255, 128, 104), bottom: rgb(226, 62, 56))
+        orb(cx: 551, topCy: 119, d: 46, red: false, glow: rgb(255, 150, 60), top: rgb(255, 184, 96), bottom: rgb(240, 120, 40))
+        for i in 0..<7 {
+            let c = DashCol(); cols.append(c)
+            for l in [c.fbar, c.rbar] { l.cornerRadius = 4; l.startPoint = CGPoint(x: 0.5, y: 1); l.endPoint = CGPoint(x: 0.5, y: 0); content.layer?.addSublayer(l) }
+            _ = i
+        }
+        var views: [NSView] = [todayLab, redNum, orgNum, fLab, fNum, fUnit, fHr, rLab, rNum, rUnit, rHr, chartLab]
+        for c in cols { views += [c.day, c.fl, c.fv, c.rl, c.rv] }
+        for v in views { content.addSubview(v) }
+    }
+
+    func show() {
+        if window == nil { build() }
+        lastSig = ""
+        refresh()
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
+    }
+
+    func mins(_ s: Double) -> String { s <= 0 ? "—" : "\(Int((s / 60).rounded())) 分 · " + String(format: "%.1f", s / 3600) + " 小時" }
+
+    func refresh() {
+        guard let w = content.window, w.isVisible else { return }
+        let f = timeLog("focusSec"), r = timeLog("restSec")
+        var cal = Calendar(identifier: .gregorian); cal.firstWeekday = 1      // 週日開頭
+        guard let start = cal.dateInterval(of: .weekOfYear, for: Date())?.start else { return }
+        let todayKey = dayFmt.string(from: Date())
+        let seq = todaySeq()
+        let reds = seq.filter { $0 == "R" }.count, oranges = seq.filter { $0 == "O" }.count
+        let fT = timeToday(f), rT = timeToday(r)
+        var days: [(key: String, label: String, fs: Double, rs: Double, today: Bool, future: Bool)] = []
+        let md = DateFormatter(); md.dateFormat = "M/d"
+        for i in 0..<7 {
+            guard let d = cal.date(byAdding: .day, value: i, to: start) else { continue }
+            let k = dayFmt.string(from: d)
+            days.append((k, "\(dayNames[i])　\(md.string(from: d))", f[k] ?? 0, r[k] ?? 0, k == todayKey, k > todayKey))
+        }
+        let sig = ([todayKey, "\(reds)", "\(oranges)"] + days.map { "\(Int($0.fs / 60)),\(Int($0.rs / 60))" }).joined(separator: "|")
+        if sig == lastSig { return }
+        lastSig = sig
+        let cx = W / 2
+        todayLab.centered("今天　TODAY", cx: cx, top: 44, H: H)
+        redNum.left("× \(reds)", x: 364, top: 96, H: H)
+        orgNum.left("× \(oranges)", x: 596, top: 96, H: H)
+        for (lab, num, unit, hr, mid, secs) in [(fLab, fNum, fUnit, fHr, CGFloat(330), fT), (rLab, rNum, rUnit, rHr, CGFloat(650), rT)] {
+            lab.centered(lab === fLab ? "專注" : "休息", cx: mid, top: 232, H: H)
+            num.put("\(Int((secs / 60).rounded()))"); unit.put("分鐘")
+            let total = num.frame.width + 8 + unit.frame.width, x0 = mid - total / 2
+            num.frame.origin = CGPoint(x: x0, y: H - 252 - num.frame.height)
+            unit.frame.origin = CGPoint(x: x0 + num.frame.width + 8, y: H - 252 - num.frame.height + 18)
+            hr.centered(String(format: "%.1f 小時", secs / 3600), cx: mid, top: 360, H: H)
+        }
+        chartLab.left("本週　日 – 六　每週日重新開始　　左：專注　右：休息", x: 60, top: 432, H: H)
+        let maxF = max(120 * 60, days.map { $0.fs }.max() ?? 0)
+        let barH: CGFloat = 150, baseTop: CGFloat = 612
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        for (i, c) in cols.enumerated() where i < days.count {
+            let d = days[i]
+            let mid = 60 + 120 * CGFloat(i) + 60
+            let dim: CGFloat = d.future ? 0.3 : (d.today ? 1.0 : 0.62)
+            c.day.tint = softWhite.withAlphaComponent(d.today ? 0.95 : 0.55 * (d.future ? 0.6 : 1))
+            c.day.centered(d.label, cx: mid, top: 626, H: H)
+            c.fl.centered("專注", cx: mid, top: 650, H: H)
+            c.fv.tint = softWhite.withAlphaComponent(0.9 * dim)
+            c.fv.centered(d.future ? "—" : mins(d.fs), cx: mid, top: 664, H: H)
+            c.rl.tint = rgb(255, 200, 130, 0.4)
+            c.rl.centered("休息", cx: mid, top: 688, H: H)
+            c.rv.tint = rgb(255, 200, 130, 0.9 * dim)
+            c.rv.centered(d.future ? "—" : mins(d.rs), cx: mid, top: 702, H: H)
+            let fh = d.fs > 0 ? max(3, CGFloat(d.fs / maxF) * barH) : 0
+            let rh = d.rs > 0 ? max(3, CGFloat(d.rs / maxF) * barH) : 0
+            let bottom = H - baseTop
+            c.fbar.frame = CGRect(x: mid - 12, y: bottom, width: 8, height: fh)
+            c.rbar.frame = CGRect(x: mid + 4, y: bottom, width: 8, height: rh)
+            let fc: [CGColor] = d.today ? [paleLime.cgColor, deepTeal.cgColor] : [rgb(140, 201, 183, 0.28).cgColor, rgb(140, 201, 183, 0.28).cgColor]
+            let rc: [CGColor] = d.today ? [rgb(255, 184, 96, 0.9).cgColor, rgb(240, 120, 40, 0.85).cgColor] : [rgb(255, 184, 96, 0.22).cgColor, rgb(255, 184, 96, 0.22).cgColor]
+            c.fbar.colors = fc; c.rbar.colors = rc
+        }
+        CATransaction.commit()
+    }
+}
+
+
+// ---------- 左下角紅橘光球的臉（蒂頭＋眼睛＋嘴巴）----------
+let eyeColor = rgb(21, 48, 42, 0.92)
+let tomatoFlat: CGFloat = 0.88          // 蕃茄光球扁一點點：高度是寬度的 88%
+func orbFace(host: CALayer, x: CGFloat, cy: CGFloat, d: CGFloat, red: Bool) {
+    let h = d * tomatoFlat
+    let discTop = cy + h / 2
+    // 蒂頭：四片細葉＋一小段梗（從 140×84 的設計稿等比縮放，柔綠）
+    let sw = d * 0.62, sc = sw / 140
+    let sx = x + d / 2 - sw / 2, oy = discTop + 0.2 * d
+    func P(_ px: CGFloat, _ py: CGFloat) -> CGPoint { CGPoint(x: sx + px * sc, y: oy - py * sc) }
+    let leaf = CGMutablePath()
+    func lf(_ a: [(CGFloat, CGFloat)]) {      // a: 起點、第一段兩個控制點與終點、第二段兩個控制點與終點
+        leaf.move(to: P(a[0].0, a[0].1))
+        leaf.addCurve(to: P(a[3].0, a[3].1), control1: P(a[1].0, a[1].1), control2: P(a[2].0, a[2].1))
+        leaf.addCurve(to: P(a[0].0, a[0].1), control1: P(a[4].0, a[4].1), control2: P(a[5].0, a[5].1))
+        leaf.closeSubpath()
+    }
+    lf([(70, 46), (52, 30), (30, 30), (14, 38), (34, 44), (52, 52)])
+    lf([(70, 46), (88, 30), (110, 30), (126, 38), (106, 44), (88, 52)])
+    lf([(70, 46), (58, 50), (46, 62), (44, 76), (58, 68), (66, 60)])
+    lf([(70, 46), (82, 50), (94, 62), (96, 76), (82, 68), (74, 60)])
+    let green = rgb(94, 158, 106)
+    let leafLayer = CAShapeLayer(); leafLayer.path = leaf; leafLayer.fillColor = green.cgColor
+    host.addSublayer(leafLayer)
+    let stem = CGMutablePath(); stem.move(to: P(70, 48)); stem.addCurve(to: P(76, 10), control1: P(69, 36), control2: P(70, 22))
+    let stemLayer = CAShapeLayer(); stemLayer.path = stem; stemLayer.strokeColor = green.cgColor
+    stemLayer.fillColor = nil; stemLayer.lineWidth = 8 * sc; stemLayer.lineCap = .round
+    host.addSublayer(stemLayer)
+    // 眼睛：兩顆小圓點（眼距 24%、眼徑 9%）
+    let eg = d * 0.24, ed = d * 0.09
+    for k in [-1, 1] {
+        let e = CALayer()
+        e.frame = CGRect(x: x + d / 2 + CGFloat(k) * eg / 2 - ed / 2, y: discTop - 0.52 * h - ed, width: ed, height: ed)
+        e.cornerRadius = ed / 2; e.backgroundColor = eyeColor.cgColor
+        host.addSublayer(e)
+    }
+    if red {
+        // 腮紅：兩團很淡的柔光
+        for bx in [0.16, 0.64] as [CGFloat] {
+            let b = CAGradientLayer(); b.type = .radial
+            b.frame = CGRect(x: x + bx * d - 0.06 * d, y: discTop - 0.72 * h - 0.04 * d, width: 0.32 * d, height: 0.2 * d)
+            b.colors = [rgb(255, 190, 180, 0.45).cgColor, rgb(255, 190, 180, 0).cgColor]
+            b.startPoint = CGPoint(x: 0.5, y: 0.5); b.endPoint = CGPoint(x: 1, y: 1)
+            host.addSublayer(b)
+        }
+        // 嘴巴：一條細細的淺弧線，兩端圓
+        let usc = d / 100
+        let mx = x + d / 2 - 0.07 * d, my = discTop - 0.65 * h
+        let m = CGMutablePath()
+        m.move(to: CGPoint(x: mx + 1 * usc, y: my - 1 * usc))
+        m.addQuadCurve(to: CGPoint(x: mx + 13 * usc, y: my - 1 * usc), control: CGPoint(x: mx + 7 * usc, y: my - 7 * usc))
+        let ml = CAShapeLayer(); ml.path = m; ml.strokeColor = eyeColor.cgColor; ml.fillColor = nil
+        ml.lineWidth = max(0.8, d * 0.03); ml.lineCap = .round
+        host.addSublayer(ml)
+    } else {
+        // 橘色：一小橫嘴
+        let mh = max(0.9, d * 0.032)
+        let m = CALayer()
+        m.frame = CGRect(x: x + d / 2 - 0.045 * d, y: discTop - 0.67 * h - mh, width: 0.09 * d, height: mh)
+        m.cornerRadius = mh / 2; m.backgroundColor = eyeColor.cgColor
+        host.addSublayer(m)
+    }
+}
+
+// ---------- 休息畫面的左右分頁：左＝基礎設定、中＝休息、右＝本週儀表板（手指往右劃看設定、往左劃看本週）----------
+struct SettingOption { let title: String; let isOn: () -> Bool; let tap: () -> Void }
+struct SettingRow { let title: String; let options: [SettingOption] }
+
+final class Chip: NSView {
+    let titleText: String
+    let label = DashText(13, .regular, softWhite)
+    var onTap: (() -> Void)?
+    var isOn = false { didSet { style() } }
+    init(_ t: String) {
+        titleText = t
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.cornerRadius = 16; layer?.borderWidth = 1
+        label.put(t)
+        frame.size = CGSize(width: label.frame.width + 32, height: 32)
+        label.frame.origin = CGPoint(x: 16, y: (32 - label.frame.height) / 2)
+        addSubview(label)
+        style()
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func mouseDown(with event: NSEvent) { onTap?() }
+    func style() {
+        layer?.borderColor = softWhite.withAlphaComponent(isOn ? 0.55 : 0.16).cgColor
+        layer?.backgroundColor = softWhite.withAlphaComponent(isOn ? 0.14 : 0).cgColor
+        label.tint = softWhite.withAlphaComponent(isOn ? 0.95 : 0.55)
+        label.put(titleText)
+    }
+}
+
+final class SettingsPage {
+    let W: CGFloat = 960, H: CGFloat = 740
+    let content = NSView()
+    var chips: [(Chip, SettingOption)] = []
+    init(rows: [SettingRow], onChange: @escaping () -> Void) {
+        content.frame = NSRect(x: 0, y: 0, width: W, height: H)
+        let head = DashText(12, .regular, softWhite.withAlphaComponent(0.45), kern: 4)
+        head.centered("基礎設定　SETTINGS", cx: W / 2, top: 44, H: H)
+        content.addSubview(head)
+        var top: CGFloat = 130
+        for row in rows {
+            let lab = DashText(13, .regular, softWhite.withAlphaComponent(0.55), kern: 3)
+            lab.left(row.title, x: 110, top: top + 8, H: H)
+            content.addSubview(lab)
+            var x: CGFloat = 370
+            for opt in row.options {
+                let c = Chip(opt.title)
+                c.frame.origin = CGPoint(x: x, y: H - top - c.frame.height)
+                c.onTap = { [weak self] in opt.tap(); self?.refresh(); onChange() }
+                content.addSubview(c); chips.append((c, opt))
+                x += c.frame.width + 12
+            }
+            top += 70
+        }
+        let foot = DashText(11, .regular, softWhite.withAlphaComponent(0.35), kern: 3)
+        foot.centered("工作時間、休息時間、長休息：下一輪生效　　其餘馬上生效", cx: W / 2, top: 650, H: H)
+        content.addSubview(foot)
+        refresh()
+    }
+    func refresh() { for (c, o) in chips { c.isOn = o.isOn() } }
+}
+
+final class OverlayPages {
+    let root: NSView
+    let left = NSView(), right = NSView()
+    let center: NSView
+    let dash = Dashboard()
+    let settings: SettingsPage
+    var dots: [CALayer] = []
+    init(size: CGSize, center: NSView, settings: SettingsPage, bottom: CGFloat) {
+        root = NSView(frame: NSRect(origin: .zero, size: size))
+        root.wantsLayer = true
+        root.layer?.masksToBounds = true
+        self.center = center; self.settings = settings
+        dash.buildContent(halo: false)
+        let o = CGPoint(x: (size.width - dash.W) / 2, y: (size.height - dash.H) / 2)
+        for p in [left, right] { p.frame = NSRect(origin: .zero, size: size); p.wantsLayer = true }
+        dash.content.frame.origin = o
+        settings.content.frame.origin = o
+        left.addSubview(settings.content)     // 手指往右劃 → 左邊那頁＝基礎設定
+        right.addSubview(dash.content)        // 手指往左劃 → 右邊那頁＝本週儀表板
+        for p in [left, center, right] { root.addSubview(p) }
+        // 底部中間：三個小點＋「本週／設定」小字，提示可以左右滑
+        let cx = size.width / 2, cy = bottom + 8
+        for i in 0..<3 {
+            let d = CALayer()
+            d.frame = CGRect(x: cx - 3 + CGFloat(i - 1) * 16, y: cy - 3, width: 6, height: 6)
+            d.cornerRadius = 3; d.backgroundColor = softWhite.cgColor
+            root.layer?.addSublayer(d); dots.append(d)
+        }
+        let l = DashText(10, .regular, softWhite.withAlphaComponent(0.3), kern: 3)
+        l.put("‹ 設定"); l.frame.origin = CGPoint(x: cx - 30 - l.frame.width, y: cy - l.frame.height / 2)
+        let r = DashText(10, .regular, softWhite.withAlphaComponent(0.3), kern: 3)
+        r.put("本週 ›"); r.frame.origin = CGPoint(x: cx + 30, y: cy - r.frame.height / 2)
+        root.addSubview(l); root.addSubview(r)
+    }
+    func layout(page: Int, animated: Bool) {
+        let w = root.bounds.width
+        let targets: [(NSView, Int)] = [(left, -1), (center, 0), (right, 1)]
+        if animated {
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.5
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                for (v, i) in targets { v.animator().setFrameOrigin(CGPoint(x: CGFloat(i - page) * w, y: 0)) }
+            }
+        } else {
+            for (v, i) in targets { v.setFrameOrigin(CGPoint(x: CGFloat(i - page) * w, y: 0)) }
+        }
+        for (i, d) in dots.enumerated() { d.opacity = (i - 1 == page) ? 0.85 : 0.22 }
+    }
+}
+
 final class App: NSObject, NSApplicationDelegate {
+    let dashboard = Dashboard()
+    var overlayPages: [OverlayPages] = []
+    var restPage = 0
     var statusItem: NSStatusItem!
     var phase = Phase.work
     var deadline = Date()
@@ -233,6 +686,9 @@ final class App: NSObject, NSApplicationDelegate {
     var tomatoTodayItem: NSMenuItem!
     var tomatoSumItem: NSMenuItem!
     var tomatoHistoryMenu: NSMenu!
+    var timeFocusItem: NSMenuItem!
+    var timeRestItem: NSMenuItem!
+    var lastTickAt = Date()
     var tomatoDay = ""          // 上次刷新小蕃茄選單時的日期，換日時自動刷新
     var roundCount = 0          // 第幾次休息
     var restDebt = 0.0          // 欠的休息（分鐘），下一輪補
@@ -241,17 +697,14 @@ final class App: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ n: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         let menu = NSMenu()
+        // 選單只留基本操作：這些項目仍會建立、更新文字，但不放進選單；統計改看休息畫面的儀表板
         statusLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-        menu.addItem(statusLine)
-        menu.addItem(.separator())
         tomatoTodayItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         tomatoSumItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-        menu.addItem(tomatoTodayItem)
-        menu.addItem(tomatoSumItem)
         let hItem = NSMenuItem(title: "小蕃茄紀錄", action: nil, keyEquivalent: "")
         tomatoHistoryMenu = NSMenu(); hItem.submenu = tomatoHistoryMenu
-        menu.addItem(hItem)
-        menu.addItem(.separator())
+        timeFocusItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        timeRestItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         pauseItem = NSMenuItem(title: "暫停", action: #selector(togglePause), keyEquivalent: "")
         menu.addItem(pauseItem)
         menu.addItem(NSMenuItem(title: "現在就休息", action: #selector(restNow), keyEquivalent: ""))
@@ -289,6 +742,7 @@ final class App: NSObject, NSApplicationDelegate {
         }
         refreshTomato()
         startWork()
+        if args.contains("--dashboard") { dashboard.show() }
         ticker = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.tick() }
         RunLoop.main.add(ticker!, forMode: .common)
     }
@@ -336,7 +790,13 @@ final class App: NSObject, NSApplicationDelegate {
         paused = false
         pauseItem.title = "暫停"
         play("Glass", times: 1)
+        restPage = initialPage
         buildOverlays()
+        if pageCycle {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in self?.changePage(-1) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { [weak self] in self?.changePage(1) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4.1) { [weak self] in self?.changePage(1) }
+        }
         update()
     }
 
@@ -352,7 +812,7 @@ final class App: NSObject, NSApplicationDelegate {
            let s = NSSound(contentsOf: url, byReference: false) {
             restEndSound?.stop()
             restEndSound = s
-            s.volume = 1.0
+            s.volume = endVolume      // 休息結束音量，預設 60%，可在休息畫面「基礎設定」改
             let ok = s.play()
             if debugLog { print(String(format: "PLAY rest-end ok=%@ duration=%.1f", ok ? "true" : "false", s.duration)) }
         } else {
@@ -367,6 +827,9 @@ final class App: NSObject, NSApplicationDelegate {
     }
 
     func tick() {
+        // 累積實際專注／休息時間（暫停不算；間隔超過 3 秒＝電腦睡眠，不算）
+        let now = Date(); let dt = now.timeIntervalSince(lastTickAt); lastTickAt = now
+        if !paused && dt > 0 && dt < 3 { addTime(phase == .work ? "focusSec" : "restSec", dt) }
         if !paused && deadline.timeIntervalSinceNow <= 0 {
             if phase == .work { startRest(earned: true) } else { finishRest() }
             return
@@ -400,6 +863,12 @@ final class App: NSObject, NSApplicationDelegate {
         if debugLog { print("MENU \(tomatoTodayItem.title) | \(tomatoSumItem.title)") }
     }
 
+    // 專注／休息時間選單：只顯示今天（每天重新計算；過了午夜自動歸零顯示）
+    func refreshTimeStats() {
+        timeFocusItem.title = "專注　今天 \(durText(timeToday(timeLog("focusSec"))))"
+        timeRestItem.title = "休息　今天 \(durText(timeToday(timeLog("restSec"))))"
+    }
+
     @objc func resetTomatoes() {
         NSApp.activate(ignoringOtherApps: true)
         let a = NSAlert()
@@ -416,10 +885,14 @@ final class App: NSObject, NSApplicationDelegate {
 
     func update() {
         if dayFmt.string(from: Date()) != tomatoDay { refreshTomato() }   // 過了午夜自動換日
+        refreshTimeStats()
+        dashboard.refresh()
+        for p in overlayPages { p.dash.refresh() }
         let r = remaining()
         let icon = phase == .work ? "🍅" : "🌙"
         statusItem.button?.title = "\(icon) \(fmt(r))" + (paused ? " ⏸" : "")
         statusLine.title = (phase == .work ? "工作中，距離休息 " : "休息中，還有 ") + fmt(r)
+        let timeLineText = "專注 \(durText(timeToday(timeLog("focusSec"))))　　休息 \(durText(timeToday(timeLog("restSec"))))"
         let t = Date().timeIntervalSince(restStart).truncatingRemainder(dividingBy: 8)
         for ui in overlayUIs {
             ui.countdown.stringValue = fmt(r)
@@ -428,6 +901,7 @@ final class App: NSObject, NSApplicationDelegate {
                 (inhale ? "吸氣" : "吐氣", NSFont.systemFont(ofSize: 20, weight: .light), softWhite.withAlphaComponent(0.8), 8),
                 (inhale ? "INHALE" : "EXHALE", NSFont.systemFont(ofSize: 11, weight: .regular), softWhite.withAlphaComponent(0.4), 5)], gap: 4)
             ui.note.stringValue = restNote
+            ui.timeLine.stringValue = timeLineText
         }
     }
 
@@ -576,7 +1050,9 @@ final class App: NSObject, NSApplicationDelegate {
             skip.show(skip.idleTitle)
             skip.onComplete = { [weak self] in self?.skipRest() }
 
-            for v in [countdown, hint, title, note, skip] as [NSView] { content.addSubview(v) }
+            let timeLine = label(S, sans(12, .regular), softWhite.withAlphaComponent(0.5))
+            timeLine.alignment = .left
+            for v in [countdown, hint, title, note, skip, timeLine] as [NSView] { content.addSubview(v) }
             let mx = size.width * 0.05, my = size.height * 0.055
 
             // 左下角：今天的小蕃茄，一顆一顆排成一列（紅＝完整做完一輪、橘＝提早休息），沒有數字
@@ -590,7 +1066,7 @@ final class App: NSObject, NSApplicationDelegate {
             row.wantsLayer = true
             var x: CGFloat = 0
             let gapGroup = d * 1.8
-            func addGroup(_ count: Int, glow: NSColor, top: NSColor, bottom: NSColor) {
+            func addGroup(_ count: Int, red: Bool, glow: NSColor, top: NSColor, bottom: NSColor) {
                 guard count > 0 else { return }
                 let cy = rowH / 2
                 let gl = glowLayer(diameter: d * 3.4, center: CGPoint(x: x + d / 2, y: cy),
@@ -598,11 +1074,18 @@ final class App: NSObject, NSApplicationDelegate {
                 row.layer?.addSublayer(gl)
                 breathe(gl, from: 0.90, to: 1.10, fade: true)
                 let disc = CAGradientLayer()
-                disc.frame = CGRect(x: x, y: cy - d / 2, width: d, height: d)
-                disc.cornerRadius = d / 2
+                disc.frame = CGRect(x: x, y: cy - d * tomatoFlat / 2, width: d, height: d * tomatoFlat)
+                disc.cornerRadius = d * tomatoFlat / 2
                 disc.colors = [top.cgColor, bottom.cgColor]
                 disc.startPoint = CGPoint(x: 0.2, y: 1); disc.endPoint = CGPoint(x: 0.8, y: 0)
+                // 邊緣柔化：外緣一小圈慢慢淡出（比硬邊柔、不糊）
+                let fm = CAGradientLayer(); fm.type = .radial; fm.frame = disc.bounds
+                fm.colors = [NSColor.white.cgColor, NSColor.white.cgColor, NSColor.clear.cgColor]
+                fm.locations = [0, 0.9, 1]
+                fm.startPoint = CGPoint(x: 0.5, y: 0.5); fm.endPoint = CGPoint(x: 1, y: 1)
+                disc.mask = fm
                 row.layer?.addSublayer(disc)
+                if let rl = row.layer { orbFace(host: rl, x: x, cy: cy, d: d, red: red) }
                 let num = NSTextField(labelWithString: "× \(count)")
                 num.font = NSFont.monospacedDigitSystemFont(ofSize: d * 0.85, weight: .ultraLight)
                 num.textColor = softWhite.withAlphaComponent(0.85)
@@ -611,13 +1094,15 @@ final class App: NSObject, NSApplicationDelegate {
                 row.addSubview(num)
                 x += d + d * 0.45 + num.frame.width + gapGroup
             }
-            addGroup(reds, glow: rgb(255, 92, 72), top: rgb(255, 128, 104), bottom: rgb(226, 62, 56))
-            addGroup(oranges, glow: rgb(255, 150, 60), top: rgb(255, 184, 96), bottom: rgb(240, 120, 40))
+            addGroup(reds, red: true, glow: rgb(255, 92, 72), top: rgb(255, 128, 104), bottom: rgb(226, 62, 56))
+            addGroup(oranges, red: false, glow: rgb(255, 150, 60), top: rgb(255, 184, 96), bottom: rgb(240, 120, 40))
             let maxX = max(1, x - gapGroup)
             content.addSubview(row)
             NSLayoutConstraint.activate([
                 row.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: mx),
-                row.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -my),
+                timeLine.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: mx),
+                timeLine.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -my),
+                row.bottomAnchor.constraint(equalTo: timeLine.topAnchor, constant: -4),
                 row.widthAnchor.constraint(equalToConstant: maxX),
                 row.heightAnchor.constraint(equalToConstant: seq.isEmpty ? 1 : rowH),
             ])
@@ -633,10 +1118,14 @@ final class App: NSObject, NSApplicationDelegate {
                 skip.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -mx),
                 skip.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -my),
             ])
-            w.contentView = content
+            let pages = OverlayPages(size: size, center: content, settings: makeSettingsPage(), bottom: my)
+            pages.layout(page: restPage, animated: false)
+            w.contentView = pages.root
+            w.onPage = { [weak self] d in self?.changePage(d) }
             w.orderFrontRegardless()
             overlays.append(w)
-            overlayUIs.append(OverlayUI(countdown: countdown, hint: hint, title: title, note: note))
+            overlayPages.append(pages)
+            overlayUIs.append(OverlayUI(countdown: countdown, hint: hint, title: title, note: note, skip: skip, timeLine: timeLine))
         }
         NSApp.activate(ignoringOtherApps: true)
         update()
@@ -646,6 +1135,7 @@ final class App: NSObject, NSApplicationDelegate {
         for w in overlays { w.orderOut(nil); w.close() }
         overlays.removeAll()
         overlayUIs.removeAll()
+        overlayPages.removeAll()
     }
 
     // ---------- 聲音 ----------
@@ -655,6 +1145,52 @@ final class App: NSObject, NSApplicationDelegate {
                 if let s = NSSound(named: name) { s.play(); Thread.sleep(forTimeInterval: max(1.0, s.duration + 0.3)) }
             }
         }
+    }
+
+    // ---------- 休息畫面：換頁與設定 ----------
+    func changePage(_ d: Int) {
+        guard phase == .rest else { return }
+        let np = max(-1, min(1, restPage + d))
+        if np == restPage { return }
+        restPage = np
+        for p in overlayPages { p.layout(page: np, animated: true) }
+    }
+    func applyWork(_ m: Double) { workMinutes = m; defaults.set(m, forKey: "workMinutes") }
+    func applyRest(_ m: Double) { restMinutes = m; defaults.set(m, forKey: "restMinutes") }
+    func applyLongEvery(_ n: Int) { longEvery = n; defaults.set(n, forKey: "longEvery") }
+    func applyLongRest(_ m: Double) { longRestMinutes = m; defaults.set(m, forKey: "longRest") }
+    func applyHold(_ s: Double) {
+        holdSeconds = s; defaults.set(s, forKey: "holdSec")
+        for ui in overlayUIs { ui.skip.idleTitle = "提早結束休息（長按 \(Int(s)) 秒）"; ui.skip.show(ui.skip.idleTitle) }
+    }
+    func applyVolume(_ v: Float) { endVolume = v; defaults.set(v, forKey: "endVolume"); previewEndSound() }
+    func previewEndSound() {     // 調音量時試聽 1.5 秒
+        guard let url = Bundle.main.url(forResource: "RestEnd", withExtension: "m4a"),
+              let s = NSSound(contentsOf: url, byReference: false) else { return }
+        restEndSound?.stop(); restEndSound = s; s.volume = endVolume; s.play()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak s] in s?.stop() }
+    }
+    func syncSettings() {
+        refreshChecks()
+        loginItem.state = loginEnabled() ? .on : .off
+        for p in overlayPages { p.settings.refresh() }
+    }
+    func makeSettingsPage() -> SettingsPage {
+        func opts<T: Equatable>(_ vals: [T], _ title: @escaping (T) -> String, _ get: @escaping () -> T, _ set: @escaping (T) -> Void) -> [SettingOption] {
+            vals.map { v in SettingOption(title: title(v), isOn: { get() == v }, tap: { set(v) }) }
+        }
+        let rows = [
+            SettingRow(title: "工作時間（分鐘）", options: opts(workChoices, { "\(Int($0))" }, { workMinutes }, { [weak self] in self?.applyWork($0) })),
+            SettingRow(title: "休息時間（分鐘）", options: opts(restChoices, { "\(Int($0))" }, { restMinutes }, { [weak self] in self?.applyRest($0) })),
+            SettingRow(title: "長休息頻率", options: opts([3, 4, 6, 0], { $0 == 0 ? "不用" : "每 \($0) 輪" }, { longEvery }, { [weak self] in self?.applyLongEvery($0) })),
+            SettingRow(title: "長休息時間（分鐘）", options: opts([10.0, 15, 20, 30], { "\(Int($0))" }, { longRestMinutes }, { [weak self] in self?.applyLongRest($0) })),
+            SettingRow(title: "提早結束要長按（秒）", options: opts([3.0, 5, 8, 10], { "\(Int($0))" }, { holdSeconds }, { [weak self] in self?.applyHold($0) })),
+            SettingRow(title: "休息結束音量", options: opts([0.2, 0.4, 0.6, 0.8, 1.0] as [Float], { "\(Int(($0 * 100).rounded()))%" }, { endVolume }, { [weak self] in self?.applyVolume($0) })),
+            SettingRow(title: "隨開機開啟", options: [
+                SettingOption(title: "開", isOn: { loginEnabled() }, tap: { _ = setLogin(true) }),
+                SettingOption(title: "關", isOn: { !loginEnabled() }, tap: { _ = setLogin(false) })]),
+        ]
+        return SettingsPage(rows: rows, onChange: { [weak self] in self?.syncSettings() })
     }
 
     // ---------- 選單動作 ----------
@@ -693,12 +1229,14 @@ final class App: NSObject, NSApplicationDelegate {
             a.runModal()
         }
     }
+    @objc func openDashboard() { dashboard.show() }
     @objc func restNow() { startRest(forced: true) }
     @objc func restartWork() { startWork() }
     // 提早結束休息：沒休完的時間記成「欠的休息」，下一輪補（最多補 5 分鐘）
     @objc func skipRest() {
         let owed = remaining() / 60
         restDebt = min(maxMakeup, restDebt + owed)
+        addToSeq("O")        // 提早結束休息 → 下一次休息畫面多一顆橘色光球
         if debugLog { print(String(format: "SKIP owed=%.2f debt=%.2f", owed, restDebt)) }
         startWork()
     }
